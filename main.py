@@ -18,7 +18,7 @@ def send_telegram_message(message):
 def main():
     client = genai.Client(api_key=GEMINI_API_KEY)
     response = client.models.generate_content(
-        model='gemini-2.5-flash',
+        model='gemini-2.0-flash',
         contents='Provide a concise daily stock market overview and key trends to watch today.',
     )
     send_telegram_message(response.text)
