@@ -67,7 +67,7 @@ def main():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise ValueError("Telegram credentials missing from environment variables/secrets.")
 
-    # Configure custom HTTP client with extended timeouts to prevent early disconnections
+    # Configure custom HTTP client with extended timeouts
     custom_httpx_client = httpx.Client(
         timeout=httpx.Timeout(connect=60.0, read=600.0, write=60.0, pool=60.0),
         limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
@@ -78,12 +78,11 @@ def main():
         http_options={"httpx_client": custom_httpx_client}
     )
 
-    # Standard production models
-    models_to_try = ['gemini-2.5-flash', 'gemini-2.5-pro']
+    # Updated active model list
+    models_to_try = ['gemini-3.8-flash', 'gemini-3.5-flash-lite']
     prompt = 'Provide a concise daily stock market overview and key trends to watch today.'
 
     for model_name in models_to_try:
-        # Retry up to 5 times for each model, handling API and socket/network errors
         for attempt in range(1, 6):
             try:
                 print(f"Generating content using model: {model_name} (Attempt {attempt})...")
@@ -99,10 +98,9 @@ def main():
                         raise RuntimeError("Failed to deliver message via Telegram.")
 
             except Exception as e:
-                # Catches ServerError, APIError, httpx.ReadError, socket resets, and generic network failures
                 print(f"Attempt {attempt} for model {model_name} failed: {type(e).__name__} - {e}")
                 if attempt < 5:
-                    wait_time = attempt * 10  # Waits 10s, 20s, 30s, 40s
+                    wait_time = attempt * 10
                     print(f"Waiting {wait_time} seconds before retrying...")
                     time.sleep(wait_time)
 
