@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install requests google-genai
-          pip install requests google-generativeai
+          
 
       - name: Run script
         env:
