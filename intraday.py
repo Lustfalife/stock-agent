@@ -4,7 +4,9 @@ intraday.py - 5-minute intraday scanner (9:45 AM to 2:30 PM IST).
 FLOW
 1. Sector bias: most sectors green -> BUY side, red -> SELL side.
    Provisional before 10:00, locked at the first check after 10:00.
-2. Nifty gate: Nifty 50 must agree (BUY: up on the day and above its 20 EMA).
+2. Live sector check: a BUY is blocked if its own sector is clearly red right
+   now (down 0.2% or more); a SELL is blocked if its sector is clearly green.
+   (Optional Nifty 50 gate is available but switched off.)
 3. SETUP: 100 EMA pullback candle
    BUY : 100 EMA > 200 EMA, close > 100 EMA, candle low < 100 EMA
    SELL: 100 EMA < 200 EMA, close < 100 EMA, candle high > 100 EMA
@@ -62,7 +64,9 @@ ATR_MAX_MULT = 3.0          # ... and at most 3 x ATR
 F_TIME = True               # no new entries late in the day
 NO_ENTRY_AFTER = dt.time(13, 30)
 
-F_NIFTY_GATE = True         # Nifty must agree with the sector bias
+F_SECTOR_LIVE = True        # block trades whose own sector is clearly against them
+SECTOR_BUFFER_PCT = 0.2     # "clearly against" = sector average move of 0.2% or more
+F_NIFTY_GATE = False        # Nifty 50 must agree with the bias (off by default)
 F_REL_STRENGTH = False      # sector must beat Nifty (buy) / lag Nifty (sell)
 F_EARNINGS_SKIP = True      # skip stocks with earnings today or yesterday
 F_NEWS_FLAG = True          # add a news warning line to alerts
@@ -278,6 +282,19 @@ def rel_ok(side, sector, sector_pct, ns):
     return sector_pct[sector] > ns["pct"] if side == "BUY" else sector_pct[sector] < ns["pct"]
 
 
+def sector_ok(side, sector, sector_pct):
+    """Soft check: only blocks when the stock's sector is clearly against the trade."""
+    v = sector_pct.get(sector)
+    if not F_SECTOR_LIVE or v is None:
+        return True
+    return v > -SECTOR_BUFFER_PCT if side == "BUY" else v < SECTOR_BUFFER_PCT
+
+
+def sector_line(sector, sector_pct):
+    v = sector_pct.get(sector)
+    return f"\n   Sector today: {v:+.2f}%" if v is not None else ""
+
+
 def check_pending(df, p):
     """Looks at candles after the setup candle (breakout entries only).
     Returns ('TRIGGER', time, close, volume_multiple), ('CANCEL', ...) or None."""
@@ -334,7 +351,7 @@ def news_today(ticker):
 
 
 # ---------------- Alert text ----------------
-def build_alert(ticker, name, side, mode, entry, sl, label, ts, extra=""):
+def build_alert(ticker, name, side, mode, entry, sl, label, ts, extra="", sec_line=""):
     """Returns the alert text, or None if the stock is skipped (earnings)."""
     if F_EARNINGS_SKIP and earnings_near(ticker):
         print(f"{ticker} skipped: earnings today/yesterday")
@@ -347,7 +364,7 @@ def build_alert(ticker, name, side, mode, entry, sl, label, ts, extra=""):
         head += f" (closed {'above' if side == 'BUY' else 'below'} {label})"
     text = (f"{icon} {name}\n   {head}\n"
             f"   Entry {entry:.2f} | SL {sl:.2f} | Target {tgt:.2f}\n"
-            f"   Risk:Reward 1:{RR} | Candle {ts.strftime('%H:%M')}{extra}")
+            f"   Risk:Reward 1:{RR} | Candle {ts.strftime('%H:%M')}{extra}{sec_line}")
     if F_NEWS_FLAG:
         for title in news_today(ticker):
             text += f"\n   ⚠️ News today: {title}"
@@ -451,11 +468,13 @@ def run():
                             continue
                         kind, ts, cl, volx = res
                         del pending[t]
-                        if kind == "TRIGGER" and open_now and not late:
+                        if (kind == "TRIGGER" and open_now and not late
+                                and sector_ok(p["side"], sector_of[t], sector_pct)):
                             alerted.add(t)
                             txt = build_alert(t, name, p["side"], "BREAKOUT", p["entry"], p["sl"],
                                               p["label"], ts,
-                                              f" | Last close {cl:.2f} | Volume {volx:.1f}x avg")
+                                              f" | Last close {cl:.2f} | Volume {volx:.1f}x avg",
+                                              sector_line(sector_of[t], sector_pct))
                             if txt:
                                 msgs.append(txt)
                         continue
@@ -466,6 +485,8 @@ def run():
                     if not s or s["side"] != bias:
                         continue
                     if F_EMA_GAP and not trend_ok(s):
+                        continue
+                    if not sector_ok(s["side"], sector_of[t], sector_pct):
                         continue
                     if not rel_ok(s["side"], sector_of[t], sector_pct, ns):
                         continue
@@ -482,7 +503,8 @@ def run():
                         alerted.add(t)
                         extra = f" | Next level {plan['next'][0]:.2f} ({plan['next'][1]})" if plan["next"] else ""
                         txt = build_alert(t, name, s["side"], "PULLBACK", plan["entry"], plan["sl"],
-                                          None, df.index[-1], extra)
+                                          None, df.index[-1], extra,
+                                          sector_line(sector_of[t], sector_pct))
                         if txt:
                             msgs.append(txt)
                     else:
