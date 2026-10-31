@@ -27,4 +27,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python intraday.py
+          TRADELOG_URL: ${{ secrets.TRADELOG_URL }}
+          TRADELOG_KEY: ${{ secrets.TRADELOG_KEY }}
+        run: python run_intraday.py
