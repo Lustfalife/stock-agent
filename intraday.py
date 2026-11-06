@@ -1,29 +1,27 @@
 """
-intraday.py - 5-minute intraday scanner (9:45 AM to 2:30 PM IST).
+intraday.py - 5-minute intraday scanner, 9:45 AM to 12:00 PM IST.
 
-FLOW
-1. Sector bias: most sectors green -> BUY side, red -> SELL side.
-   Provisional before 10:00, locked at the first check after 10:00.
-2. Live sector check: a BUY is blocked if its own sector is clearly red right
-   now (down 0.2% or more); a SELL is blocked if its sector is clearly green.
-   (Optional Nifty 50 gate is available but switched off.)
-3. SETUP: 100 EMA pullback candle
-   BUY : 100 EMA > 200 EMA, close > 100 EMA, candle low < 100 EMA
-   SELL: 100 EMA < 200 EMA, close < 100 EMA, candle high > 100 EMA
-4. ROOM CHECK: is there at least 1.5R of space before the day's / previous
-   day's high (buy) or low (sell)?
-   - Yes  -> PULLBACK ENTRY: alert at the close of the setup candle.
-   - No   -> BREAKOUT ENTRY: wait for a 5-min candle to CLOSE beyond that level.
-5. Entry alert has Entry, SL and Target (1 : 1.5).
+RULES
+ BUY : close > 100 EMA > 200 EMA, candle low < 100 EMA, candle closes above the 100 EMA.
+ SELL: close < 100 EMA < 200 EMA, candle high > 100 EMA, candle closes below the 100 EMA.
+ The signal candle must be at least 1.3x the average range of the previous 3 candles.
+ SECTOR: each stock follows its OWN sector, checked live. Sector up more than 0.1% = BUYS
+ only, down more than 0.1% = SELLS only, flat = no trade. The sector index (Nifty IT, Auto,
+ Pharma, FMCG, Metal, Energy, Realty, Media) is used where Yahoo has it; otherwise the
+ average move of the sector's Nifty 500 stocks.
+ ENTRY: if there is room (1.5R) before the day's / previous day's high (buy) or low (sell),
+ alert at the signal candle's close (PULLBACK); otherwise wait for a candle to CLOSE beyond
+ that level (BREAKOUT). SL from the last 4 candles, target 1:1.5.
+ LIMITS: at most 5 alerts a day and 2 per sector, strongest candle first.
 
-Every filter below has an on/off switch (True / False).
-Set TEST_ONCE=1 to run a single check on the latest available data.
+Set TEST_ONCE=1 to run a single check on the latest data any time (nothing is logged).
 """
 import io
 import os
 import sys
 import time
 import datetime as dt
+from collections import defaultdict
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -34,12 +32,16 @@ from scanner import send_telegram, HEADERS, NIFTY500_URL, get_news, CATALYST_WOR
 
 IST = ZoneInfo("Asia/Kolkata")
 START_TIME = dt.time(9, 45)
-BIAS_TIME = dt.time(10, 0)
-END_TIME = dt.time(14, 30)
+END_TIME = dt.time(12, 1)            # last check at 12:00 (it looks at the 11:55 candle)
 TEST_ONCE = os.getenv("TEST_ONCE") == "1"
 
 # ===================== SETTINGS YOU CAN CHANGE =====================
 RR = 1.5                    # reward : risk  (1 : 1.5)
+SIZE_MULT = 1.3             # signal candle >= 1.3 x average range of the previous 3 candles
+SIZE_CANDLES = 3
+SECTOR_THRESHOLD_PCT = 0.1  # sector must be beyond +/-0.1% to allow a direction
+MAX_ALERTS_PER_DAY = 5
+MAX_PER_SECTOR = 2
 SL_CANDLES = 4              # SL = lowest low / highest high of last 4 candles
 DAY_NEAR_PCT = 0.15         # use day high/low for SL if within this % of it
 EXPIRY_CANDLES = 12         # a waiting breakout setup expires after 12 candles
@@ -61,16 +63,16 @@ F_ATR_SL = True             # skip tiny or very wide stop losses
 ATR_MIN_MULT = 0.8          # SL distance must be at least 0.8 x ATR
 ATR_MAX_MULT = 3.0          # ... and at most 3 x ATR
 
-F_TIME = True               # no new entries late in the day
-NO_ENTRY_AFTER = dt.time(13, 30)
-
-F_SECTOR_LIVE = True        # block trades whose own sector is clearly against them
-SECTOR_BUFFER_PCT = 0.2     # "clearly against" = sector average move of 0.2% or more
-F_NIFTY_GATE = False        # Nifty 50 must agree with the bias (off by default)
-F_REL_STRENGTH = False      # sector must beat Nifty (buy) / lag Nifty (sell)
 F_EARNINGS_SKIP = True      # skip stocks with earnings today or yesterday
 F_NEWS_FLAG = True          # add a news warning line to alerts
 # ====================================================================
+
+# sector name (any part of it) -> Yahoo sector index. Sectors not listed use the stock average.
+SECTOR_INDEX_KEYWORDS = [
+    ("information technology", "^CNXIT"), ("auto", "^CNXAUTO"), ("health", "^CNXPHARMA"),
+    ("fast moving", "^CNXFMCG"), ("metal", "^CNXMETAL"), ("oil", "^CNXENERGY"),
+    ("power", "^CNXENERGY"), ("realty", "^CNXREALTY"), ("media", "^CNXMEDIA"),
+]
 
 
 def safe_send(text):
@@ -142,6 +144,7 @@ def completed_only(df):
 
 
 def sector_changes(frames, sector_of, data_date):
+    """Average % move today of the stocks in each sector (needs 3+ stocks)."""
     rows = []
     for t, df in frames.items():
         prev = df[df.index.date < data_date]
@@ -157,31 +160,64 @@ def sector_changes(frames, sector_of, data_date):
     return g[g["count"] >= MIN_STOCKS_PER_SECTOR]["mean"].sort_values(ascending=False)
 
 
-# ---------------- Nifty gate ----------------
-def nifty_state():
-    """Nifty 50 change today and whether it is above its 20 EMA. None if unavailable."""
-    try:
-        d = yf.download("^NSEI", period="5d", interval="5m", auto_adjust=True, progress=False)
-        if isinstance(d.columns, pd.MultiIndex):
-            d.columns = d.columns.get_level_values(0)
-        d = completed_only(prepare(d))
-        day = d.index[-1].date()
-        prev = d[d.index.date < day]
-        cur = d[d.index.date == day]
-        pct = (float(cur["Close"].iloc[-1]) / float(prev["Close"].iloc[-1]) - 1) * 100
-        ema20 = float(d["Close"].ewm(span=20, adjust=False).mean().iloc[-1])
-        return {"pct": pct, "above": float(d["Close"].iloc[-1]) > ema20}
-    except Exception as e:
-        print("Nifty data unavailable:", e)
-        return None
+# ---------------- Sector direction ----------------
+def index_for(sector):
+    s = sector.lower()
+    for kw, tk in SECTOR_INDEX_KEYWORDS:
+        if kw in s:
+            return tk
+    return None
 
 
-def gate_open(bias, ns):
-    if not F_NIFTY_GATE or ns is None:
-        return True
-    if bias == "BUY":
-        return ns["pct"] > 0 and ns["above"]
-    return ns["pct"] < 0 and not ns["above"]
+def index_changes(tickers, data_date):
+    """% change today for each Yahoo sector index (None if its data is missing or stale)."""
+    out = {}
+    for tk in sorted(set(tickers)):
+        try:
+            d = yf.download(tk, period="5d", interval="5m", auto_adjust=True, progress=False)
+            if isinstance(d.columns, pd.MultiIndex):
+                d.columns = d.columns.get_level_values(0)
+            d = completed_only(prepare(d))
+            if d.empty or d.index[-1].date() != data_date:
+                out[tk] = None
+                continue
+            prev = d[d.index.date < data_date]
+            cur = d[d.index.date == data_date]
+            if prev.empty or cur.empty:
+                out[tk] = None
+                continue
+            out[tk] = (float(cur["Close"].iloc[-1]) / float(prev["Close"].iloc[-1]) - 1) * 100
+        except Exception as e:
+            print(f"index {tk} unavailable:", e)
+            out[tk] = None
+    return out
+
+
+def sector_view(sectors, sector_avg, idx_pct):
+    """sector -> (% move, source, allowed direction 'BUY' / 'SELL' / None)."""
+    view = {}
+    for sec in sectors:
+        tk = index_for(sec)
+        if tk and idx_pct.get(tk) is not None:
+            pct, how = float(idx_pct[tk]), f"index {tk.lstrip('^')}"
+        elif sec in sector_avg:
+            pct, how = float(sector_avg[sec]), "stock average"
+        else:
+            continue
+        direction = "BUY" if pct > SECTOR_THRESHOLD_PCT else "SELL" if pct < -SECTOR_THRESHOLD_PCT else None
+        view[sec] = (pct, how, direction)
+    return view
+
+
+def snapshot_message(view, last_candle, now, sent_total):
+    lag = (now - (last_candle + pd.Timedelta(minutes=5))).total_seconds() / 60
+    L = [f"🧭 Sector direction - {now.strftime('%H:%M')} IST",
+         f"Data: latest 5-min candle {last_candle.strftime('%H:%M')} "
+         f"({max(lag, 0):.0f} min behind the clock) | alerts so far: {sent_total}/{MAX_ALERTS_PER_DAY}"]
+    for sec, (pct, how, d) in sorted(view.items(), key=lambda x: -x[1][0]):
+        side = {"BUY": "BUYS only", "SELL": "SELLS only", None: "no trade"}[d]
+        L.append(f"{sec}: {pct:+.2f}% ({how}) -> {side}")
+    return "\n".join(L)
 
 
 # ---------------- Strategy pieces ----------------
@@ -218,7 +254,7 @@ def atr(df, n=20):
 
 
 def raw_setup(df):
-    """The 100 EMA pullback candle. Returns a dict or None."""
+    """The 100 EMA candle. Returns a dict or None."""
     close = df["Close"]
     ema100 = close.ewm(span=100, adjust=False).mean()
     ema200 = close.ewm(span=200, adjust=False).mean()
@@ -230,7 +266,13 @@ def raw_setup(df):
         side = "SELL"
     else:
         return None
-    return {"side": side, "c": c, "e100": e100, "e200": e200, "ema100": ema100, "ema200": ema200}
+    rngs = (df["High"] - df["Low"]).iloc[-(SIZE_CANDLES + 1):]
+    avg_prev = float(rngs.iloc[:-1].mean())
+    rng = float(rngs.iloc[-1])
+    if avg_prev <= 0 or rng < SIZE_MULT * avg_prev:
+        return None
+    return {"side": side, "c": c, "e100": e100, "e200": e200, "ema100": ema100,
+            "ema200": ema200, "range_x": rng / avg_prev}
 
 
 def trend_ok(s):
@@ -276,23 +318,12 @@ def atr_ok(df, plan):
     return a > 0 and ATR_MIN_MULT * a <= risk <= ATR_MAX_MULT * a
 
 
-def rel_ok(side, sector, sector_pct, ns):
-    if not F_REL_STRENGTH or ns is None or sector not in sector_pct:
-        return True
-    return sector_pct[sector] > ns["pct"] if side == "BUY" else sector_pct[sector] < ns["pct"]
-
-
-def sector_ok(side, sector, sector_pct):
-    """Soft check: only blocks when the stock's sector is clearly against the trade."""
-    v = sector_pct.get(sector)
-    if not F_SECTOR_LIVE or v is None:
-        return True
-    return v > -SECTOR_BUFFER_PCT if side == "BUY" else v < SECTOR_BUFFER_PCT
-
-
-def sector_line(sector, sector_pct):
-    v = sector_pct.get(sector)
-    return f"\n   Sector today: {v:+.2f}%" if v is not None else ""
+def sector_line(sector, view):
+    v = view.get(sector)
+    if not v:
+        return ""
+    how = "index" if v[1].startswith("index") else "stock avg"
+    return f"\n   Sector today: {v[0]:+.2f}% ({how})"
 
 
 def check_pending(df, p):
@@ -371,17 +402,6 @@ def build_alert(ticker, name, side, mode, entry, sl, label, ts, extra="", sec_li
     return text
 
 
-def bias_message(changes, bias, locked):
-    green = int((changes > 0).sum())
-    red = int((changes < 0).sum())
-    top = ", ".join(f"{k} {v:+.1f}%" for k, v in changes.head(3).items())
-    bot = ", ".join(f"{k} {v:+.1f}%" for k, v in changes.tail(3).items())
-    tag = "" if locked else " (provisional, final at 10:00)"
-    return (f"🧭 Market bias: {bias} side{tag}\n"
-            f"Sectors: {green} green / {red} red\n"
-            f"Strongest: {top}\nWeakest: {bot}")
-
-
 # ---------------- Main loop ----------------
 def run():
     now = now_ist()
@@ -395,22 +415,20 @@ def run():
     universe = load_universe()
     sector_of = dict(zip(universe["ticker"], universe["sector"]))
     all_tickers = universe["ticker"].tolist()
+    sectors = sorted(set(sector_of.values()))
+    index_tickers = [index_for(s) for s in sectors if index_for(s)]
 
-    bias = None
-    locked = False
-    watch = all_tickers
-    alerted = set()
-    pending = {}
+    alerted, pending = set(), {}
+    sent_total, sent_sector = 0, defaultdict(int)
     fails = 0
-    announced = False
-    gate_prev = None
+    first_snapshot = mid_snapshot = False
 
     while True:
         now = now_ist()
         if not TEST_ONCE and now.time() >= END_TIME:
             break
         try:
-            frames = download(watch)
+            frames = download(all_tickers)
             frames = {t: completed_only(d) for t, d in frames.items()}
             frames = {t: d for t, d in frames.items() if len(d) >= 210}
             if not frames:
@@ -421,100 +439,87 @@ def run():
                 return
             fails = 0
 
-            # ----- sector bias (whole universe until locked) -----
-            changes = sector_changes(frames, sector_of, data_date)
-            sector_pct = changes.to_dict() if changes is not None else {}
-            if not locked and changes is not None and len(changes):
-                green, red = (changes > 0).sum(), (changes < 0).sum()
-                new_bias = "BUY" if green >= red else "SELL"
-                ready = TEST_ONCE or now.time() >= BIAS_TIME
-                if ready:
-                    locked = True
-                if ready or not announced or new_bias != bias:
-                    safe_send(bias_message(changes, new_bias, ready))
-                    announced = True
-                bias = new_bias
-                good = set(changes[changes > 0].index) if bias == "BUY" else set(changes[changes < 0].index)
-                if locked:
-                    watch = [t for t in all_tickers if sector_of[t] in good]
-                    frames = {t: d for t, d in frames.items() if t in watch}
+            # ----- live sector direction -----
+            avg = sector_changes(frames, sector_of, data_date)
+            avg = avg.to_dict() if avg is not None else {}
+            view = sector_view(sectors, avg, index_changes(index_tickers, data_date))
+            last_candle = max(d.index[-1] for d in frames.values())
+            if not first_snapshot or (not mid_snapshot and now.time() >= dt.time(11, 0)):
+                safe_send(snapshot_message(view, last_candle, now, sent_total))
+                if first_snapshot:
+                    mid_snapshot = True
+                first_snapshot = True
+
+            # ----- setups, breakouts -----
+            cands = []
+            for t, df in frames.items():
+                if t in alerted:
+                    continue
+                sec = sector_of[t]
+                direction = view.get(sec, (0, "", None))[2]
+                name = f"{t.replace('.NS', '')} ({sec})"
+
+                if t in pending:                           # waiting breakout setup
+                    p = pending[t]
+                    res = check_pending(df, p)
+                    if res is None:
+                        continue
+                    kind, ts, cl, volx = res
+                    del pending[t]
+                    if kind == "TRIGGER" and direction == p["side"]:
+                        cands.append({"t": t, "name": name, "sector": sec, "side": p["side"],
+                                      "mode": "BREAKOUT", "entry": p["entry"], "sl": p["sl"],
+                                      "label": p["label"], "ts": ts, "score": p["score"],
+                                      "extra": f" | Last close {cl:.2f} | Volume {volx:.1f}x avg"})
+                    continue
+
+                if direction is None:
+                    continue
+                s = raw_setup(df)
+                if not s or s["side"] != direction:
+                    continue
+                if F_EMA_GAP and not trend_ok(s):
+                    continue
+                plan = plan_trade(df, s)
+                if not plan:
+                    continue
+                if plan["mode"] == "PULLBACK" and not ENABLE_PULLBACK_ENTRY:
+                    continue
+                if plan["mode"] == "BREAKOUT" and not ENABLE_BREAKOUT_ENTRY:
+                    continue
+                if F_ATR_SL and not atr_ok(df, plan):
+                    continue
+                if plan["mode"] == "PULLBACK":
+                    extra = (f" | Next level {plan['next'][0]:.2f} ({plan['next'][1]})"
+                             if plan["next"] else "")
+                    extra += f" | Candle {s['range_x']:.1f}x prev 3"
+                    cands.append({"t": t, "name": name, "sector": sec, "side": s["side"],
+                                  "mode": "PULLBACK", "entry": plan["entry"], "sl": plan["sl"],
+                                  "label": None, "ts": df.index[-1], "score": s["range_x"],
+                                  "extra": extra})
                 else:
-                    frames = {t: d for t, d in frames.items() if sector_of[t] in good}
+                    pending[t] = {"side": s["side"], "entry": plan["entry"], "sl": plan["sl"],
+                                  "label": plan["label"], "ts": df.index[-1], "score": s["range_x"]}
 
-            if bias:
-                # ----- Nifty gate -----
-                ns = nifty_state() if (F_NIFTY_GATE or F_REL_STRENGTH) else None
-                open_now = gate_open(bias, ns)
-                if F_NIFTY_GATE and ns is not None and open_now != gate_prev:
-                    if not (gate_prev is None and open_now):
-                        state = "OPEN" if open_now else "CLOSED"
-                        safe_send(f"🚦 Nifty gate {state} for {bias} trades "
-                                  f"(Nifty {ns['pct']:+.2f}% today, "
-                                  f"{'above' if ns['above'] else 'below'} its 20 EMA)")
-                    gate_prev = open_now
-                late = F_TIME and not TEST_ONCE and now.time() >= NO_ENTRY_AFTER
-
-                # ----- setups, breakouts, alerts -----
-                msgs = []
-                for t, df in frames.items():
-                    if t in alerted:
-                        continue
-                    name = f"{t.replace('.NS', '')} ({sector_of[t]})"
-
-                    if t in pending:                       # waiting breakout setup
-                        p = pending[t]
-                        res = check_pending(df, p)
-                        if res is None:
-                            continue
-                        kind, ts, cl, volx = res
-                        del pending[t]
-                        if (kind == "TRIGGER" and open_now and not late
-                                and sector_ok(p["side"], sector_of[t], sector_pct)):
-                            alerted.add(t)
-                            txt = build_alert(t, name, p["side"], "BREAKOUT", p["entry"], p["sl"],
-                                              p["label"], ts,
-                                              f" | Last close {cl:.2f} | Volume {volx:.1f}x avg",
-                                              sector_line(sector_of[t], sector_pct))
-                            if txt:
-                                msgs.append(txt)
-                        continue
-
-                    if not open_now or late:               # new setups need an open gate
-                        continue
-                    s = raw_setup(df)
-                    if not s or s["side"] != bias:
-                        continue
-                    if F_EMA_GAP and not trend_ok(s):
-                        continue
-                    if not sector_ok(s["side"], sector_of[t], sector_pct):
-                        continue
-                    if not rel_ok(s["side"], sector_of[t], sector_pct, ns):
-                        continue
-                    plan = plan_trade(df, s)
-                    if not plan:
-                        continue
-                    if plan["mode"] == "PULLBACK" and not ENABLE_PULLBACK_ENTRY:
-                        continue
-                    if plan["mode"] == "BREAKOUT" and not ENABLE_BREAKOUT_ENTRY:
-                        continue
-                    if F_ATR_SL and not atr_ok(df, plan):
-                        continue
-                    if plan["mode"] == "PULLBACK":
-                        alerted.add(t)
-                        extra = f" | Next level {plan['next'][0]:.2f} ({plan['next'][1]})" if plan["next"] else ""
-                        txt = build_alert(t, name, s["side"], "PULLBACK", plan["entry"], plan["sl"],
-                                          None, df.index[-1], extra,
-                                          sector_line(sector_of[t], sector_pct))
-                        if txt:
-                            msgs.append(txt)
-                    else:
-                        pending[t] = {"side": s["side"], "entry": plan["entry"], "sl": plan["sl"],
-                                      "label": plan["label"], "ts": df.index[-1]}
-
-                if msgs:
-                    safe_send(f"⏱ {now.strftime('%H:%M')} IST - {bias} ENTRY ALERTS\n\n" + "\n\n".join(msgs))
-                else:
-                    print(f"{now.strftime('%H:%M')} no alerts; {len(pending)} breakout setups waiting")
+            # ----- limits: strongest candle first, 5 a day, 2 per sector -----
+            msgs = []
+            for c in sorted(cands, key=lambda x: -x["score"]):
+                if sent_total >= MAX_ALERTS_PER_DAY:
+                    break
+                if sent_sector[c["sector"]] >= MAX_PER_SECTOR:
+                    continue
+                alerted.add(c["t"])
+                txt = build_alert(c["t"], c["name"], c["side"], c["mode"], c["entry"], c["sl"],
+                                  c["label"], c["ts"], c["extra"], sector_line(c["sector"], view))
+                if txt:
+                    msgs.append(txt)
+                    sent_total += 1
+                    sent_sector[c["sector"]] += 1
+            if msgs:
+                safe_send(f"⏱ {now.strftime('%H:%M')} IST - ENTRY ALERTS "
+                          f"({sent_total} of {MAX_ALERTS_PER_DAY} today)\n\n" + "\n\n".join(msgs))
+            else:
+                print(f"{now.strftime('%H:%M')} no alerts; {len(pending)} breakout setups waiting")
         except Exception as e:
             fails += 1
             print("cycle error:", type(e).__name__, e)
@@ -530,7 +535,7 @@ def run():
         nxt = (n + dt.timedelta(minutes=mins)).replace(second=30, microsecond=0)
         time.sleep(max(5, (nxt - now_ist()).total_seconds()))
 
-    safe_send("🏁 Intraday scanner finished for today (2:30 PM).")
+    safe_send(f"🏁 Intraday scanner finished (12:00 PM). Alerts today: {sent_total}/{MAX_ALERTS_PER_DAY}")
 
 
 if __name__ == "__main__":
